@@ -30,9 +30,11 @@ Or with custom options:
 import { createFontdueSchemas } from "fontdue-sanity-sync";
 
 const fontdueSchemas = createFontdueSchemas({
-  includeParentRef: true,   // Add parent reference on collections
-  includeFamilyRef: true,   // Add family reference on styles
-  includeUpdatedAt: true,   // Add updatedAt field on collections
+  includeParentRef: true,         // Add parent reference on collections
+  includeFamilyRef: true,         // Add family reference on styles
+  includeUpdatedAt: true,         // Add updatedAt field on collections
+  includeStyleFontMetadata: true, // dateModified + versionString on fontdueStyle
+  includeFeatureStyleRef: true,   // featureStyle reference on fontdueCollection
 });
 ```
 
@@ -60,6 +62,8 @@ const result = await syncFontdueData({
 | `includeParentRef` | `boolean` | `false` | Sync parent references on collections |
 | `includeFamilyRef` | `boolean` | `false` | Sync family references on styles |
 | `includeUpdatedAt` | `boolean` | `false` | Write updatedAt field on collections |
+| `includeStyleFontMetadata` | `boolean` | `false` | Write `dateModified` and `versionString` on styles |
+| `includeFeatureStyleRef` | `boolean` | `false` | Write `featureStyle` reference on collections |
 | `storeSyncStatus` | `boolean` | `true` | Write a `fontdueSyncStatus` document after sync |
 
 ### Deletion behavior
