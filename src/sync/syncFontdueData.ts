@@ -105,7 +105,7 @@ export async function syncFontdueData({
   const [existingCollections, existingStyles, existingLicenses] =
     await Promise.all([
       sanityClient.fetch<any[]>(
-        `*[_type == "fontdueCollection"]{ _id, fontdueId, name, slug, collectionType, children, styles, updatedAt }`,
+        `*[_type == "fontdueCollection"]{ _id, fontdueId, name, slug, collectionType, children, styles, updatedAt, featureStyle }`,
       ),
       sanityClient.fetch<any[]>(
         `*[_type == "fontdueStyle"]{ _id, fontdueId, name, dateModified, versionString }`,
@@ -372,6 +372,62 @@ export async function syncFontdueData({
       "Syncing styles",
       docsToUpdateStyle.length,
       docsToUpdateStyle.length,
+    );
+  }
+
+  // 5b: Feature-style reference on collections (only if changed)
+  const featureStylePatches: {
+    sanityId: string;
+    patch: Record<string, unknown>;
+  }[] = [];
+  if (includeFeatureStyleRef) {
+    for (const collection of collections) {
+      if (!collection.featureStyle?.id) continue;
+      const collectionSanityId = collectionIdMap.get(collection.id);
+      const featureStyleSanityId = toSanityId(
+        "fontdueStyle",
+        collection.featureStyle.id,
+      );
+      if (!collectionSanityId || !syncedStyleIds.has(featureStyleSanityId)) {
+        continue;
+      }
+      const existing = existingCollectionsMap.get(collectionSanityId);
+      const existingRef = (
+        existing?.featureStyle as { _ref?: string } | undefined
+      )?._ref;
+      if (existingRef === featureStyleSanityId) continue;
+      featureStylePatches.push({
+        sanityId: collectionSanityId,
+        patch: {
+          featureStyle: {
+            _type: "reference",
+            _ref: featureStyleSanityId,
+          },
+        },
+      });
+    }
+  }
+
+  if (!dryRun && featureStylePatches.length > 0) {
+    const featureStyleBatches = chunk(featureStylePatches, batchSize);
+    let processed = 0;
+    for (const batch of featureStyleBatches) {
+      progress(
+        "Setting feature style references",
+        processed,
+        featureStylePatches.length,
+      );
+      const transaction = sanityClient.transaction();
+      for (const { sanityId, patch } of batch) {
+        transaction.patch(sanityId, (p) => p.set(patch));
+      }
+      await transaction.commit({ visibility: "sync" });
+      processed += batch.length;
+    }
+    progress(
+      "Setting feature style references",
+      featureStylePatches.length,
+      featureStylePatches.length,
     );
   }
 
