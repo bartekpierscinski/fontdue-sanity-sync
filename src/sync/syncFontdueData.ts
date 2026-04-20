@@ -10,12 +10,15 @@ interface FontdueCollection {
   collectionType: string;
   parent: { id: string } | null;
   fontStyles: FontdueStyle[];
+  featureStyle: { id: string } | null;
   updatedAt: string | null;
 }
 
 interface FontdueStyle {
   id: string;
   name: string;
+  dateModified: string | null;
+  versionString: string | null;
 }
 
 interface FontdueLicense {
@@ -36,9 +39,12 @@ const SYNC_QUERY = `
             collectionType
             parent { id }
             updatedAt
+            featureStyle { id }
             fontStyles {
               id
               name
+              dateModified
+              versionString
             }
           }
         }
