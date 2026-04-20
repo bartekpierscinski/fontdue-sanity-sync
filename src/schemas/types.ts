@@ -14,4 +14,8 @@ export interface SchemaOptions {
   includeFamilyRef?: boolean;
   /** Add updatedAt field on collections for change tracking (default: false) */
   includeUpdatedAt?: boolean;
+  /** Add dateModified + versionString fields on fontdueStyle (default: false) */
+  includeStyleFontMetadata?: boolean;
+  /** Add featureStyle reference on fontdueCollection (default: false) */
+  includeFeatureStyleRef?: boolean;
 }

@@ -18,6 +18,10 @@ export interface SyncOptions {
   includeFamilyRef?: boolean;
   /** Write updatedAt field on collection documents (default: false) */
   includeUpdatedAt?: boolean;
+  /** Write dateModified and versionString on style documents (default: false) */
+  includeStyleFontMetadata?: boolean;
+  /** Write featureStyle reference on collection documents (default: false) */
+  includeFeatureStyleRef?: boolean;
   /** Write a fontdueSyncStatus document after sync (default: true) */
   storeSyncStatus?: boolean;
 }
