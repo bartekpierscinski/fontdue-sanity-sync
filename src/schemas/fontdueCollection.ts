@@ -4,6 +4,7 @@ import type { SchemaOptions } from "./types.js";
 export function createFontdueCollection(options?: SchemaOptions) {
   const includeParentRef = options?.includeParentRef === true;
   const includeUpdatedAt = options?.includeUpdatedAt === true;
+  const includeFeatureStyleRef = options?.includeFeatureStyleRef === true;
   const collectionIcon = options?.icons?.collection;
   const superfamilyIcon = options?.icons?.superfamily;
 
@@ -71,6 +72,20 @@ export function createFontdueCollection(options?: SchemaOptions) {
             name: "updatedAt",
             title: "Updated At",
             type: "datetime",
+            hidden: true,
+          }),
+        ]
+      : []),
+    ...(includeFeatureStyleRef
+      ? [
+          defineField({
+            name: "featureStyle",
+            title: "Feature Style",
+            description:
+              "The style shown as the family's representative, synced from Fontdue.",
+            type: "reference",
+            to: [{ type: "fontdueStyle" }],
+            readOnly: true,
             hidden: true,
           }),
         ]
