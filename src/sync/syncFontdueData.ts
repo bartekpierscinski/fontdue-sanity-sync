@@ -75,6 +75,8 @@ export async function syncFontdueData({
   includeParentRef = false,
   includeFamilyRef = false,
   includeUpdatedAt = false,
+  includeStyleFontMetadata = false,
+  includeFeatureStyleRef = false,
   storeSyncStatus = true,
 }: SyncOptions): Promise<SyncResult> {
   const startTime = Date.now();
@@ -106,7 +108,7 @@ export async function syncFontdueData({
         `*[_type == "fontdueCollection"]{ _id, fontdueId, name, slug, collectionType, children, styles, updatedAt }`,
       ),
       sanityClient.fetch<any[]>(
-        `*[_type == "fontdueStyle"]{ _id, fontdueId, name }`,
+        `*[_type == "fontdueStyle"]{ _id, fontdueId, name, dateModified, versionString }`,
       ),
       sanityClient.fetch<any[]>(
         `*[_type == "fontdueLicense"]{ _id, fontdueId, name, slug }`,
@@ -323,6 +325,11 @@ export async function syncFontdueData({
         doc.family = { _type: "reference", _ref: collectionSanityId };
       }
 
+      if (includeStyleFontMetadata) {
+        if (style.dateModified) doc.dateModified = style.dateModified;
+        if (style.versionString) doc.versionString = style.versionString;
+      }
+
       return doc;
     }),
   );
@@ -333,13 +340,19 @@ export async function syncFontdueData({
     if (!existing) {
       stats.styles.created++;
       docsToUpdateStyle.push(doc);
+      continue;
+    }
+    const basicChanged =
+      existing.fontdueId !== doc.fontdueId || existing.name !== doc.name;
+    const metadataChanged =
+      includeStyleFontMetadata &&
+      (existing.dateModified !== doc.dateModified ||
+        existing.versionString !== doc.versionString);
+    if (basicChanged || metadataChanged) {
+      stats.styles.updated++;
+      docsToUpdateStyle.push(doc);
     } else {
-      if (existing.fontdueId !== doc.fontdueId || existing.name !== doc.name) {
-        stats.styles.updated++;
-        docsToUpdateStyle.push(doc);
-      } else {
-        stats.styles.skippedUnchanged++;
-      }
+      stats.styles.skippedUnchanged++;
     }
   }
 
