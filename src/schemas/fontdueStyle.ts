@@ -38,7 +38,6 @@ export function createFontdueStyle(options?: SchemaOptions) {
               "From the font file's head table; set by Fontdue on upload.",
             type: "datetime",
             readOnly: true,
-            hidden: true,
           }),
           defineField({
             name: "versionString",
@@ -46,7 +45,6 @@ export function createFontdueStyle(options?: SchemaOptions) {
             description: "Raw string from the font file's name table.",
             type: "string",
             readOnly: true,
-            hidden: true,
           }),
         ]
       : []),

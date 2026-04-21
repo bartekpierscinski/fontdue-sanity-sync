@@ -72,7 +72,7 @@ export function createFontdueCollection(options?: SchemaOptions) {
             name: "updatedAt",
             title: "Updated At",
             type: "datetime",
-            hidden: true,
+            readOnly: true,
           }),
         ]
       : []),
@@ -86,7 +86,6 @@ export function createFontdueCollection(options?: SchemaOptions) {
             type: "reference",
             to: [{ type: "fontdueStyle" }],
             readOnly: true,
-            hidden: true,
           }),
         ]
       : []),
