@@ -7,6 +7,7 @@ export interface SchemaOptions {
     superfamily?: ComponentType;
     style?: ComponentType;
     license?: ComponentType;
+    pack?: ComponentType;
   };
   /** Add parent reference on collections for bidirectional relationships (default: false) */
   includeParentRef?: boolean;
@@ -18,4 +19,16 @@ export interface SchemaOptions {
   includeStyleFontMetadata?: boolean;
   /** Add featureStyle reference on fontdueCollection (default: false) */
   includeFeatureStyleRef?: boolean;
+  /**
+   * Register the `fontduePack` document type (default: false).
+   * Pair with `syncPacks: true` in `syncFontdueData`.
+   */
+  includePacks?: boolean;
+  /**
+   * Declare the `isDeleted` / `deletedAt` fields on collections and packs
+   * (default: false). Written by `syncFontdueData` when `orphanStrategy` is
+   * `"softDelete"`; without them the Studio flags soft-deleted documents as
+   * carrying unknown fields.
+   */
+  includeSoftDelete?: boolean;
 }

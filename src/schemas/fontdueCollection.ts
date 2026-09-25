@@ -1,10 +1,12 @@
 import { defineField, defineType } from "sanity";
 import type { SchemaOptions } from "./types.js";
+import { softDeleteFields } from "./softDeleteFields.js";
 
 export function createFontdueCollection(options?: SchemaOptions) {
   const includeParentRef = options?.includeParentRef === true;
   const includeUpdatedAt = options?.includeUpdatedAt === true;
   const includeFeatureStyleRef = options?.includeFeatureStyleRef === true;
+  const includeSoftDelete = options?.includeSoftDelete === true;
   const collectionIcon = options?.icons?.collection;
   const superfamilyIcon = options?.icons?.superfamily;
 
@@ -89,6 +91,7 @@ export function createFontdueCollection(options?: SchemaOptions) {
           }),
         ]
       : []),
+    ...(includeSoftDelete ? softDeleteFields() : []),
   ];
 
   return defineType({
@@ -101,16 +104,20 @@ export function createFontdueCollection(options?: SchemaOptions) {
       select: {
         title: "name",
         collectionType: "collectionType",
+        isDeleted: "isDeleted",
         ...(includeParentRef ? { parentName: "parent.name" } : {}),
       },
       prepare(selection) {
-        const { title, collectionType } = selection;
+        const { title, collectionType, isDeleted } = selection;
         const parentName =
           "parentName" in selection ? selection.parentName : undefined;
 
         let subtitle = collectionType;
         if (parentName) {
           subtitle = `${collectionType} in ${parentName}`;
+        }
+        if (isDeleted) {
+          subtitle = `${subtitle} · removed from Fontdue`;
         }
 
         const icon =

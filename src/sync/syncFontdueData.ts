@@ -2,6 +2,13 @@ import type { SanityClient } from "@sanity/client";
 import type { SyncOptions, SyncResult, SyncStats } from "./types.js";
 import { toSanityId, chunk } from "./utils.js";
 import { cleanupExternalReferences } from "./cleanupReferences.js";
+import { fontdueRequest } from "./fontdueRequest.js";
+import {
+  buildPackDocument,
+  fetchFontduePacks,
+  packChanged,
+  type PackDocument,
+} from "./packs.js";
 
 interface FontdueCollection {
   id: string;
@@ -27,7 +34,15 @@ interface FontdueLicense {
   slug: { name: string } | null;
 }
 
-const SYNC_QUERY = `
+interface SyncResponse {
+  viewer: {
+    fontCollections: { edges: { node: FontdueCollection }[] } | null;
+    licenses: FontdueLicense[] | null;
+  } | null;
+}
+
+/** Unchanged since 0.3.1: consumers that set no new option issue this exact request */
+export const SYNC_QUERY = `
   query SyncData {
     viewer {
       fontCollections(first: 1000) {
@@ -58,12 +73,75 @@ const SYNC_QUERY = `
   }
 `;
 
+/** Documents this package writes; references between them never keep an orphan alive */
+const SYNCED_TYPES = ["fontdueCollection", "fontdueStyle", "fontdueLicense", "fontduePack"];
+
+function emptyStats(): SyncStats {
+  return { created: 0, updated: 0, deleted: 0, skippedUnchanged: 0 };
+}
+
+type Patch = { sanityId: string; patch: Record<string, unknown> };
+
+async function commitPatches(
+  sanityClient: SanityClient,
+  patches: Patch[],
+  batchSize: number,
+  stage: string,
+  progress: (stage: string, current: number, total: number) => void,
+): Promise<void> {
+  const batches = chunk(patches, batchSize);
+  let processed = 0;
+  for (const batch of batches) {
+    progress(stage, processed, patches.length);
+    const transaction = sanityClient.transaction();
+    for (const { sanityId, patch } of batch) {
+      transaction.patch(sanityId, (p) => p.set(patch));
+    }
+    await transaction.commit({ visibility: "sync" });
+    processed += batch.length;
+  }
+  progress(stage, patches.length, patches.length);
+}
+
+async function commitDocuments(
+  sanityClient: SanityClient,
+  docs: { _id: string; _type: string }[],
+  batchSize: number,
+  stage: string,
+  progress: (stage: string, current: number, total: number) => void,
+): Promise<void> {
+  const batches = chunk(docs, batchSize);
+  let processed = 0;
+  for (const batch of batches) {
+    progress(stage, processed, docs.length);
+    const transaction = sanityClient.transaction();
+    for (const doc of batch) {
+      transaction.createOrReplace(doc);
+    }
+    await transaction.commit({ visibility: "sync" });
+    processed += batch.length;
+  }
+  progress(stage, docs.length, docs.length);
+}
+
+function sameRefsSorted(existing: { _ref: string }[] | undefined, next: { _ref: string }[]): boolean {
+  const a = (existing || []).map((r) => r._ref).sort();
+  const b = next.map((r) => r._ref).sort();
+  return a.length === b.length && a.every((ref, i) => ref === b[i]);
+}
+
 /**
  * Sync Fontdue data to Sanity.
  *
- * Fetches collections, styles, and licenses from Fontdue and creates/updates
- * corresponding documents in Sanity. Cleans up orphaned documents that no
- * longer exist in Fontdue, removing all references before deletion.
+ * Fetches collections, styles and licenses (and, with `syncPacks`, font
+ * packs) from Fontdue and creates/updates the corresponding documents in
+ * Sanity. Documents that are no longer in Fontdue are deleted after every
+ * reference to them is removed, or, with `orphanStrategy: "softDelete"`,
+ * kept and flagged while something still references them.
+ *
+ * Nothing is written before Fontdue has answered without errors, and a run
+ * in which Fontdue lists no collections at all aborts unless
+ * `allowEmptyCatalog` is set, so one bad response cannot empty the dataset.
  */
 export async function syncFontdueData({
   sanityClient,
@@ -78,34 +156,41 @@ export async function syncFontdueData({
   includeStyleFontMetadata = false,
   includeFeatureStyleRef = false,
   storeSyncStatus = true,
+  syncPacks = false,
+  orphanStrategy = "delete",
+  allowEmptyCatalog = false,
 }: SyncOptions): Promise<SyncResult> {
   const startTime = Date.now();
   const progress = onProgress || (() => {});
+  const softDelete = orphanStrategy === "softDelete";
 
-  // --- Phase 1: Fetch data from Fontdue ---
+  // --- Phase 1: Fetch data from Fontdue (throws on any error, before any write) ---
   progress("Fetching from Fontdue", 0, 1);
-  const response = await fetch(`${fontdueUrl}/graphql`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: SYNC_QUERY }),
-  });
-
-  const { data } = await response.json();
+  const data = await fontdueRequest<SyncResponse>(fontdueUrl, SYNC_QUERY);
   progress("Fetching from Fontdue", 1, 1);
 
-  const collections: FontdueCollection[] =
-    data.viewer.fontCollections?.edges?.map(
-      (edge: { node: FontdueCollection }) => edge.node,
-    ) ?? [];
+  const connection = data.viewer?.fontCollections;
+  if (!connection) {
+    throw new Error(
+      "Fontdue returned no font collection connection; nothing was written",
+    );
+  }
 
-  const licenses: FontdueLicense[] = data.viewer.licenses ?? [];
+  const collections: FontdueCollection[] = (connection.edges ?? [])
+    .map((edge) => edge?.node)
+    .filter((node): node is FontdueCollection => Boolean(node));
+  const licenses: FontdueLicense[] = data.viewer?.licenses ?? [];
+
+  // Packs are fetched up front too, so a failing pack request is known
+  // before the first write; the documents are built once styles exist (6b).
+  const packsFetch = syncPacks ? await fetchFontduePacks(fontdueUrl) : null;
 
   // --- Phase 2: Fetch existing Sanity documents ---
   progress("Fetching existing Sanity documents", 0, 1);
-  const [existingCollections, existingStyles, existingLicenses] =
+  const [existingCollections, existingStyles, existingLicenses, existingPacks] =
     await Promise.all([
       sanityClient.fetch<any[]>(
-        `*[_type == "fontdueCollection"]{ _id, fontdueId, name, slug, collectionType, children, styles, updatedAt, featureStyle }`,
+        `*[_type == "fontdueCollection"]{ _id, fontdueId, name, slug, collectionType, children, styles, updatedAt, featureStyle, isDeleted }`,
       ),
       sanityClient.fetch<any[]>(
         `*[_type == "fontdueStyle"]{ _id, fontdueId, name, dateModified, versionString }`,
@@ -113,24 +198,31 @@ export async function syncFontdueData({
       sanityClient.fetch<any[]>(
         `*[_type == "fontdueLicense"]{ _id, fontdueId, name, slug }`,
       ),
+      syncPacks
+        ? sanityClient.fetch<any[]>(
+            `*[_type == "fontduePack"]{ _id, fontdueId, name, slug, visibility, totalStyles, members, isDeleted }`,
+          )
+        : Promise.resolve([] as any[]),
     ]);
   progress("Fetching existing Sanity documents", 1, 1);
+
+  if (collections.length === 0 && existingCollections.length > 0 && !allowEmptyCatalog) {
+    throw new Error(
+      `Fontdue returned no collections while Sanity holds ${existingCollections.length}; aborting before any write. Pass allowEmptyCatalog: true if the catalog really is empty.`,
+    );
+  }
 
   const existingCollectionsMap = new Map(
     existingCollections.map((d) => [d._id, d]),
   );
   const existingStylesMap = new Map(existingStyles.map((d) => [d._id, d]));
   const existingLicensesMap = new Map(existingLicenses.map((d) => [d._id, d]));
+  const existingPacksMap = new Map(existingPacks.map((d) => [d._id, d]));
 
   const stats = {
-    collections: {
-      created: 0,
-      updated: 0,
-      deleted: 0,
-      skippedUnchanged: 0,
-    },
-    styles: { created: 0, updated: 0, deleted: 0, skippedUnchanged: 0 },
-    licenses: { created: 0, updated: 0, deleted: 0, skippedUnchanged: 0 },
+    collections: emptyStats(),
+    styles: emptyStats(),
+    licenses: emptyStats(),
   };
 
   const syncedCollectionIds = new Set<string>();
@@ -168,56 +260,36 @@ export async function syncFontdueData({
     return doc;
   });
 
-  // Change detection: only update if fields actually changed
+  // Change detection: only update if fields actually changed. A document
+  // flagged isDeleted that is back in Fontdue is rewritten (which drops the flag)
   const docsToUpdateCollection = [];
   for (const doc of collectionDocs) {
     const existing = existingCollectionsMap.get(doc._id as string);
     if (!existing) {
       stats.collections.created++;
       docsToUpdateCollection.push(doc);
+    } else if (
+      existing.fontdueId !== doc.fontdueId ||
+      existing.name !== doc.name ||
+      existing.slug !== doc.slug ||
+      existing.collectionType !== doc.collectionType ||
+      existing.isDeleted === true
+    ) {
+      stats.collections.updated++;
+      docsToUpdateCollection.push(doc);
     } else {
-      if (
-        existing.fontdueId !== doc.fontdueId ||
-        existing.name !== doc.name ||
-        existing.slug !== doc.slug ||
-        existing.collectionType !== doc.collectionType
-      ) {
-        stats.collections.updated++;
-        docsToUpdateCollection.push(doc);
-      } else {
-        stats.collections.skippedUnchanged++;
-      }
+      stats.collections.skippedUnchanged++;
     }
   }
 
   if (!dryRun && docsToUpdateCollection.length > 0) {
-    const collectionBatches = chunk(docsToUpdateCollection, batchSize);
-    let processed = 0;
-    for (const batch of collectionBatches) {
-      progress(
-        "Syncing collections",
-        processed,
-        docsToUpdateCollection.length,
-      );
-      const transaction = sanityClient.transaction();
-      for (const doc of batch) {
-        transaction.createOrReplace(doc);
-      }
-      await transaction.commit({ visibility: "sync" });
-      processed += batch.length;
-    }
-    progress(
-      "Syncing collections",
-      docsToUpdateCollection.length,
-      docsToUpdateCollection.length,
-    );
+    await commitDocuments(sanityClient, docsToUpdateCollection, batchSize, "Syncing collections", progress);
   }
 
   // --- Phase 4: Build relationship patches ---
 
   // 4a: Parent references for collections where parent came after child in the list
-  const parentPatches: { sanityId: string; patch: Record<string, unknown> }[] =
-    [];
+  const parentPatches: Patch[] = [];
   if (includeParentRef) {
     for (const collection of collections) {
       if (collection.parent?.id) {
@@ -250,7 +322,7 @@ export async function syncFontdueData({
     }
   }
 
-  const childrenPatches = Array.from(childrenByParent.entries())
+  const childrenPatches: Patch[] = Array.from(childrenByParent.entries())
     .map(([parentId, childIds]) => ({
       sanityId: parentId,
       patch: {
@@ -264,39 +336,13 @@ export async function syncFontdueData({
     .filter(({ sanityId, patch }) => {
       const existing = existingCollectionsMap.get(sanityId);
       if (!existing) return true;
-      const existingRefs = (existing.children || [])
-        .map((c: { _ref: string }) => c._ref)
-        .sort();
-      const newRefs = patch.children.map((c) => c._ref).sort();
-      return (
-        existingRefs.length !== newRefs.length ||
-        existingRefs.some((ref: string, i: number) => ref !== newRefs[i])
-      );
+      return !sameRefsSorted(existing.children, patch.children as { _ref: string }[]);
     });
 
   const allRelationshipPatches = [...parentPatches, ...childrenPatches];
 
   if (!dryRun && allRelationshipPatches.length > 0) {
-    const patchBatches = chunk(allRelationshipPatches, batchSize);
-    let processed = 0;
-    for (const batch of patchBatches) {
-      progress(
-        "Setting collection relationships",
-        processed,
-        allRelationshipPatches.length,
-      );
-      const transaction = sanityClient.transaction();
-      for (const { sanityId, patch } of batch) {
-        transaction.patch(sanityId, (p) => p.set(patch));
-      }
-      await transaction.commit({ visibility: "sync" });
-      processed += batch.length;
-    }
-    progress(
-      "Setting collection relationships",
-      allRelationshipPatches.length,
-      allRelationshipPatches.length,
-    );
+    await commitPatches(sanityClient, allRelationshipPatches, batchSize, "Setting collection relationships", progress);
   }
 
   // --- Phase 5: Build & sync style documents ---
@@ -357,29 +403,11 @@ export async function syncFontdueData({
   }
 
   if (!dryRun && docsToUpdateStyle.length > 0) {
-    const styleBatches = chunk(docsToUpdateStyle, batchSize);
-    let processed = 0;
-    for (const batch of styleBatches) {
-      progress("Syncing styles", processed, docsToUpdateStyle.length);
-      const transaction = sanityClient.transaction();
-      for (const doc of batch) {
-        transaction.createOrReplace(doc);
-      }
-      await transaction.commit({ visibility: "sync" });
-      processed += batch.length;
-    }
-    progress(
-      "Syncing styles",
-      docsToUpdateStyle.length,
-      docsToUpdateStyle.length,
-    );
+    await commitDocuments(sanityClient, docsToUpdateStyle, batchSize, "Syncing styles", progress);
   }
 
   // 5b: Feature-style reference on collections (only if changed)
-  const featureStylePatches: {
-    sanityId: string;
-    patch: Record<string, unknown>;
-  }[] = [];
+  const featureStylePatches: Patch[] = [];
   if (includeFeatureStyleRef) {
     for (const collection of collections) {
       if (!collection.featureStyle?.id) continue;
@@ -409,30 +437,11 @@ export async function syncFontdueData({
   }
 
   if (!dryRun && featureStylePatches.length > 0) {
-    const featureStyleBatches = chunk(featureStylePatches, batchSize);
-    let processed = 0;
-    for (const batch of featureStyleBatches) {
-      progress(
-        "Setting feature style references",
-        processed,
-        featureStylePatches.length,
-      );
-      const transaction = sanityClient.transaction();
-      for (const { sanityId, patch } of batch) {
-        transaction.patch(sanityId, (p) => p.set(patch));
-      }
-      await transaction.commit({ visibility: "sync" });
-      processed += batch.length;
-    }
-    progress(
-      "Setting feature style references",
-      featureStylePatches.length,
-      featureStylePatches.length,
-    );
+    await commitPatches(sanityClient, featureStylePatches, batchSize, "Setting feature style references", progress);
   }
 
   // Link styles to families (only if changed)
-  const stylePatches = Array.from(stylesByFamily.entries())
+  const stylePatches: Patch[] = Array.from(stylesByFamily.entries())
     .map(([familyId, styleIds]) => ({
       sanityId: familyId,
       patch: {
@@ -446,33 +455,11 @@ export async function syncFontdueData({
     .filter(({ sanityId, patch }) => {
       const existing = existingCollectionsMap.get(sanityId);
       if (!existing) return true;
-      const existingRefs = (existing.styles || [])
-        .map((s: { _ref: string }) => s._ref)
-        .sort();
-      const newRefs = patch.styles.map((s) => s._ref).sort();
-      return (
-        existingRefs.length !== newRefs.length ||
-        existingRefs.some((ref: string, i: number) => ref !== newRefs[i])
-      );
+      return !sameRefsSorted(existing.styles, patch.styles as { _ref: string }[]);
     });
 
   if (!dryRun && stylePatches.length > 0) {
-    const stylePatchBatches = chunk(stylePatches, batchSize);
-    let processed = 0;
-    for (const batch of stylePatchBatches) {
-      progress("Linking styles to families", processed, stylePatches.length);
-      const transaction = sanityClient.transaction();
-      for (const { sanityId, patch } of batch) {
-        transaction.patch(sanityId, (p) => p.set(patch));
-      }
-      await transaction.commit({ visibility: "sync" });
-      processed += batch.length;
-    }
-    progress(
-      "Linking styles to families",
-      stylePatches.length,
-      stylePatches.length,
-    );
+    await commitPatches(sanityClient, stylePatches, batchSize, "Linking styles to families", progress);
   }
 
   // --- Phase 6: Build & sync license documents ---
@@ -494,37 +481,67 @@ export async function syncFontdueData({
     if (!existing) {
       stats.licenses.created++;
       docsToUpdateLicense.push(doc);
+    } else if (
+      existing.fontdueId !== doc.fontdueId ||
+      existing.name !== doc.name ||
+      existing.slug !== doc.slug
+    ) {
+      stats.licenses.updated++;
+      docsToUpdateLicense.push(doc);
     } else {
-      if (
-        existing.fontdueId !== doc.fontdueId ||
-        existing.name !== doc.name ||
-        existing.slug !== doc.slug
-      ) {
-        stats.licenses.updated++;
-        docsToUpdateLicense.push(doc);
-      } else {
-        stats.licenses.skippedUnchanged++;
-      }
+      stats.licenses.skippedUnchanged++;
     }
   }
 
   if (!dryRun && docsToUpdateLicense.length > 0) {
-    const licenseBatches = chunk(docsToUpdateLicense, batchSize);
-    let processed = 0;
-    for (const batch of licenseBatches) {
-      progress("Syncing licenses", processed, docsToUpdateLicense.length);
-      const transaction = sanityClient.transaction();
-      for (const doc of batch) {
-        transaction.createOrReplace(doc);
+    await commitDocuments(sanityClient, docsToUpdateLicense, batchSize, "Syncing licenses", progress);
+  }
+
+  // --- Phase 6b: Build & sync font pack documents ---
+  // After styles and collections exist (a pack holds strong references to
+  // both) and before orphan handling (so a rewritten pack no longer points
+  // at a style that is about to go). A skipped fetch leaves every existing
+  // pack document exactly as it is.
+  let packStats: SyncStats | undefined;
+  let packsSkipped: string | undefined;
+  const syncedPackIds = new Set<string>();
+  let packPhaseRan = false;
+
+  if (packsFetch) {
+    if (packsFetch.status === "skipped") {
+      packsSkipped = packsFetch.reason;
+    } else {
+      packPhaseRan = true;
+      packStats = emptyStats();
+      let unresolvedMembers = 0;
+      const packDocs: PackDocument[] = packsFetch.packs.map((pack) => {
+        const built = buildPackDocument(pack, syncedCollectionIds, syncedStyleIds);
+        unresolvedMembers += built.unresolvedMembers;
+        syncedPackIds.add(built.doc._id);
+        return built.doc;
+      });
+
+      const docsToUpdatePack: PackDocument[] = [];
+      for (const doc of packDocs) {
+        const existing = existingPacksMap.get(doc._id);
+        if (!existing) {
+          packStats.created++;
+          docsToUpdatePack.push(doc);
+        } else if (packChanged(existing, doc)) {
+          packStats.updated++;
+          docsToUpdatePack.push(doc);
+        } else {
+          packStats.skippedUnchanged++;
+        }
       }
-      await transaction.commit({ visibility: "sync" });
-      processed += batch.length;
+
+      if (!dryRun && docsToUpdatePack.length > 0) {
+        await commitDocuments(sanityClient, docsToUpdatePack, batchSize, "Syncing font packs", progress);
+      }
+      if (unresolvedMembers > 0) {
+        progress("Font pack members without a synced target (left out)", unresolvedMembers, unresolvedMembers);
+      }
     }
-    progress(
-      "Syncing licenses",
-      docsToUpdateLicense.length,
-      docsToUpdateLicense.length,
-    );
   }
 
   // --- Phase 7: Handle orphaned documents ---
@@ -537,30 +554,72 @@ export async function syncFontdueData({
   const orphanedLicenseIds = Array.from(existingLicensesMap.keys()).filter(
     (id) => !syncedLicenseIds.has(id),
   );
+  // Pack orphans exist only when the pack phase ran: a skipped or disabled
+  // pack sync must never read as "every pack is gone"
+  const orphanedPackIds = packPhaseRan
+    ? Array.from(existingPacksMap.keys()).filter((id) => !syncedPackIds.has(id))
+    : [];
 
   stats.styles.deleted = orphanedStyleIds.length;
   stats.collections.deleted = orphanedCollectionIds.length;
   stats.licenses.deleted = orphanedLicenseIds.length;
+  if (packStats) packStats.deleted = orphanedPackIds.length;
 
-  const allOrphanedIds = [
+  // Soft delete: a collection or pack that any document outside this
+  // package's own types still references is kept and flagged; references
+  // held only by synced documents (a superfamily's children, a family's
+  // styles, a pack's members) do not count, or every orphan would look alive
+  let collectionsToHardDelete = orphanedCollectionIds;
+  let packsToHardDelete = orphanedPackIds;
+  let toSoftDelete: string[] = [];
+
+  if (softDelete && (orphanedCollectionIds.length > 0 || orphanedPackIds.length > 0)) {
+    progress("Checking references to removed documents", 0, 1);
+    const candidates = [...orphanedCollectionIds, ...orphanedPackIds];
+    const referenced = await sanityClient.fetch<{ _id: string; referenced: boolean }[]>(
+      `*[_id in $ids]{ _id, "referenced": count(*[references(^._id) && !(_type in $syncedTypes)]) > 0 }`,
+      { ids: candidates, syncedTypes: SYNCED_TYPES },
+    );
+    progress("Checking references to removed documents", 1, 1);
+    const referencedSet = new Set(referenced.filter((r) => r.referenced).map((r) => r._id));
+    toSoftDelete = candidates.filter((id) => referencedSet.has(id));
+    collectionsToHardDelete = orphanedCollectionIds.filter((id) => !referencedSet.has(id));
+    packsToHardDelete = orphanedPackIds.filter((id) => !referencedSet.has(id));
+  }
+
+  // Flag newly removed documents; ones already flagged are left alone so a
+  // steady state writes nothing (and wakes no webhook)
+  const softDeletePatches: Patch[] = toSoftDelete
+    .filter((id) => {
+      const existing = existingCollectionsMap.get(id) ?? existingPacksMap.get(id);
+      return existing?.isDeleted !== true;
+    })
+    .map((id) => ({
+      sanityId: id,
+      patch: { isDeleted: true, deletedAt: new Date().toISOString() },
+    }));
+
+  if (!dryRun && softDeletePatches.length > 0) {
+    await commitPatches(sanityClient, softDeletePatches, batchSize, "Flagging removed documents", progress);
+  }
+
+  const allHardDeleteIds = [
+    ...packsToHardDelete,
+    ...collectionsToHardDelete,
     ...orphanedStyleIds,
-    ...orphanedCollectionIds,
     ...orphanedLicenseIds,
   ];
 
-  if (!dryRun && allOrphanedIds.length > 0) {
+  if (!dryRun && allHardDeleteIds.length > 0) {
     // Step 1: Clean internal references (fontdueCollection.styles[] and .children[])
     const orphanedStyleSet = new Set(orphanedStyleIds);
-    const orphanedCollectionSet = new Set(orphanedCollectionIds);
+    const orphanedCollectionSet = new Set(collectionsToHardDelete);
 
     const currentCollections = await sanityClient.fetch<any[]>(
       `*[_type == "fontdueCollection"]{ _id, children, styles }`,
     );
 
-    const internalCleanups: {
-      sanityId: string;
-      patch: Record<string, unknown>;
-    }[] = [];
+    const internalCleanups: Patch[] = [];
 
     for (const existing of currentCollections) {
       const patchFields: Record<string, unknown> = {};
@@ -589,45 +648,24 @@ export async function syncFontdueData({
     }
 
     if (internalCleanups.length > 0) {
-      const cleanupBatches = chunk(internalCleanups, batchSize);
-      let processed = 0;
-      for (const batch of cleanupBatches) {
-        progress(
-          "Removing internal references",
-          processed,
-          internalCleanups.length,
-        );
-        const transaction = sanityClient.transaction();
-        for (const { sanityId, patch } of batch) {
-          transaction.patch(sanityId, (p) => p.set(patch));
-        }
-        await transaction.commit({ visibility: "sync" });
-        processed += batch.length;
-      }
-      progress(
-        "Removing internal references",
-        internalCleanups.length,
-        internalCleanups.length,
-      );
+      await commitPatches(sanityClient, internalCleanups, batchSize, "Removing internal references", progress);
     }
 
-    // Step 2: Clean external references (any document referencing orphaned IDs)
+    // Step 2: Clean external references (any document referencing the ids
+    // about to be deleted, a pack's members[] included)
     await cleanupExternalReferences({
       sanityClient,
-      orphanedIds: allOrphanedIds,
+      orphanedIds: allHardDeleteIds,
       batchSize,
       onProgress: progress,
     });
 
-    // Step 3: Hard-delete all orphaned documents
-    const deleteBatches = chunk(allOrphanedIds, batchSize);
+    // Step 3: Hard-delete, packs before collections before styles, so a
+    // referencing document never outlives what it references within a batch
+    const deleteBatches = chunk(allHardDeleteIds, batchSize);
     let processed = 0;
     for (const batch of deleteBatches) {
-      progress(
-        "Deleting orphaned documents",
-        processed,
-        allOrphanedIds.length,
-      );
+      progress("Deleting orphaned documents", processed, allHardDeleteIds.length);
       const transaction = sanityClient.transaction();
       for (const id of batch) {
         transaction.delete(id);
@@ -635,11 +673,7 @@ export async function syncFontdueData({
       await transaction.commit({ visibility: "sync" });
       processed += batch.length;
     }
-    progress(
-      "Deleting orphaned documents",
-      allOrphanedIds.length,
-      allOrphanedIds.length,
-    );
+    progress("Deleting orphaned documents", allHardDeleteIds.length, allHardDeleteIds.length);
   }
 
   // --- Phase 8: Save sync status ---
@@ -649,6 +683,8 @@ export async function syncFontdueData({
     collections: stats.collections,
     styles: stats.styles,
     licenses: stats.licenses,
+    ...(packStats ? { packs: packStats } : {}),
+    ...(packsSkipped ? { packsSkipped } : {}),
     durationMs,
     triggeredBy,
     status: "success",
@@ -662,6 +698,8 @@ export async function syncFontdueData({
       collections: stats.collections,
       styles: stats.styles,
       licenses: stats.licenses,
+      ...(packStats ? { packs: packStats } : {}),
+      ...(packsSkipped ? { packsSkipped } : {}),
       durationMs,
       triggeredBy,
       status: "success" as const,

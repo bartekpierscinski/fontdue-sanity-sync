@@ -82,6 +82,21 @@ export function createFontdueSyncStatus() {
         fields: statsFields("licenses"),
       }),
       defineField({
+        name: "packs",
+        title: "Font Packs",
+        type: "object",
+        fields: statsFields("packs"),
+        hidden: ({ document }) => !document?.packs,
+      }),
+      defineField({
+        name: "packsSkipped",
+        title: "Font packs skipped",
+        description:
+          "Why the last run left font packs untouched (unsupported backend, request failure)",
+        type: "string",
+        hidden: ({ document }) => !document?.packsSkipped,
+      }),
+      defineField({
         name: "errorMessage",
         title: "Error Message",
         type: "text",
