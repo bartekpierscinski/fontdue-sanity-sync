@@ -190,7 +190,7 @@ export async function syncFontdueData({
   const [existingCollections, existingStyles, existingLicenses, existingPacks] =
     await Promise.all([
       sanityClient.fetch<any[]>(
-        `*[_type == "fontdueCollection"]{ _id, fontdueId, name, slug, collectionType, children, styles, updatedAt, featureStyle, isDeleted }`,
+        `*[_type == "fontdueCollection"]{ _id, fontdueId, name, slug, collectionType, parent, children, styles, updatedAt, featureStyle, isDeleted }`,
       ),
       sanityClient.fetch<any[]>(
         `*[_type == "fontdueStyle"]{ _id, fontdueId, name, dateModified, versionString }`,
@@ -230,10 +230,13 @@ export async function syncFontdueData({
   const syncedLicenseIds = new Set<string>();
 
   // --- Phase 3: Build & sync collection documents ---
-  const collectionIdMap = new Map<string, string>();
+  // Ids are mapped up front so a child listed before its superfamily still
+  // gets its parent reference in the document itself
+  const collectionIdMap = new Map<string, string>(
+    collections.map((c) => [c.id, toSanityId("fontdueCollection", c.id)]),
+  );
   const collectionDocs = collections.map((collection) => {
-    const sanityId = toSanityId("fontdueCollection", collection.id);
-    collectionIdMap.set(collection.id, sanityId);
+    const sanityId = collectionIdMap.get(collection.id)!;
     syncedCollectionIds.add(sanityId);
 
     const doc: { _id: string; _type: string; [key: string]: unknown } = {
@@ -249,7 +252,6 @@ export async function syncFontdueData({
       doc.updatedAt = collection.updatedAt;
     }
 
-    // Include parent reference directly if parent was already processed
     if (includeParentRef && collection.parent?.id) {
       const parentSanityId = collectionIdMap.get(collection.parent.id);
       if (parentSanityId) {
@@ -261,10 +263,13 @@ export async function syncFontdueData({
   });
 
   // Change detection: only update if fields actually changed. A document
-  // flagged isDeleted that is back in Fontdue is rewritten (which drops the flag)
+  // flagged isDeleted that is back in Fontdue is rewritten (which drops the flag).
+  // A parent change counts too, so moving a family into or out of a
+  // superfamily reaches Sanity.
   const docsToUpdateCollection = [];
   for (const doc of collectionDocs) {
     const existing = existingCollectionsMap.get(doc._id as string);
+    const parentRef = (doc.parent as { _ref?: string } | undefined)?._ref;
     if (!existing) {
       stats.collections.created++;
       docsToUpdateCollection.push(doc);
@@ -273,7 +278,8 @@ export async function syncFontdueData({
       existing.name !== doc.name ||
       existing.slug !== doc.slug ||
       existing.collectionType !== doc.collectionType ||
-      existing.isDeleted === true
+      existing.isDeleted === true ||
+      (includeParentRef && existing.parent?._ref !== parentRef)
     ) {
       stats.collections.updated++;
       docsToUpdateCollection.push(doc);
@@ -282,32 +288,21 @@ export async function syncFontdueData({
     }
   }
 
+  // createOrReplace drops children, styles and featureStyle, so the
+  // relationship checks below must treat a rewritten document as having none,
+  // not compare against what it held before this run
+  const rewrittenCollectionIds = new Set(docsToUpdateCollection.map((d) => d._id));
+  const collectionStateAfterWrite = (sanityId: string) =>
+    rewrittenCollectionIds.has(sanityId) ? undefined : existingCollectionsMap.get(sanityId);
+
   if (!dryRun && docsToUpdateCollection.length > 0) {
     await commitDocuments(sanityClient, docsToUpdateCollection, batchSize, "Syncing collections", progress);
   }
 
-  // --- Phase 4: Build relationship patches ---
-
-  // 4a: Parent references for collections where parent came after child in the list
-  const parentPatches: Patch[] = [];
-  if (includeParentRef) {
-    for (const collection of collections) {
-      if (collection.parent?.id) {
-        const sanityId = collectionIdMap.get(collection.id);
-        const parentSanityId = collectionIdMap.get(collection.parent.id);
-        // Only patch if parent wasn't included in the initial createOrReplace
-        const initialDoc = collectionDocs.find((d) => d._id === sanityId);
-        if (sanityId && parentSanityId && !initialDoc?.parent) {
-          parentPatches.push({
-            sanityId,
-            patch: { parent: { _type: "reference", _ref: parentSanityId } },
-          });
-        }
-      }
-    }
-  }
-
-  // 4b: Children arrays for superfamilies (only if changed)
+  // --- Phase 4: Children arrays for superfamilies (only if changed) ---
+  // Parent references are part of the collection documents written above.
+  // Every synced collection is checked, so a superfamily whose last family
+  // left gets an empty children array instead of keeping the stale one.
   const childrenByParent = new Map<string, string[]>();
   for (const collection of collections) {
     if (collection.parent?.id) {
@@ -322,27 +317,26 @@ export async function syncFontdueData({
     }
   }
 
-  const childrenPatches: Patch[] = Array.from(childrenByParent.entries())
-    .map(([parentId, childIds]) => ({
-      sanityId: parentId,
+  const childrenPatches: Patch[] = collectionDocs
+    .map(({ _id }) => ({
+      sanityId: _id,
       patch: {
-        children: childIds.map((id) => ({
+        children: (childrenByParent.get(_id) ?? []).map((id) => ({
           _type: "reference",
           _ref: id,
           _key: id,
         })),
       },
     }))
-    .filter(({ sanityId, patch }) => {
-      const existing = existingCollectionsMap.get(sanityId);
-      if (!existing) return true;
-      return !sameRefsSorted(existing.children, patch.children as { _ref: string }[]);
-    });
+    .filter(({ sanityId, patch }) =>
+      !sameRefsSorted(
+        collectionStateAfterWrite(sanityId)?.children,
+        patch.children as { _ref: string }[],
+      ),
+    );
 
-  const allRelationshipPatches = [...parentPatches, ...childrenPatches];
-
-  if (!dryRun && allRelationshipPatches.length > 0) {
-    await commitPatches(sanityClient, allRelationshipPatches, batchSize, "Setting collection relationships", progress);
+  if (!dryRun && childrenPatches.length > 0) {
+    await commitPatches(sanityClient, childrenPatches, batchSize, "Setting collection relationships", progress);
   }
 
   // --- Phase 5: Build & sync style documents ---
@@ -419,7 +413,7 @@ export async function syncFontdueData({
       if (!collectionSanityId || !syncedStyleIds.has(featureStyleSanityId)) {
         continue;
       }
-      const existing = existingCollectionsMap.get(collectionSanityId);
+      const existing = collectionStateAfterWrite(collectionSanityId);
       const existingRef = (
         existing?.featureStyle as { _ref?: string } | undefined
       )?._ref;
@@ -452,11 +446,12 @@ export async function syncFontdueData({
         })),
       },
     }))
-    .filter(({ sanityId, patch }) => {
-      const existing = existingCollectionsMap.get(sanityId);
-      if (!existing) return true;
-      return !sameRefsSorted(existing.styles, patch.styles as { _ref: string }[]);
-    });
+    .filter(({ sanityId, patch }) =>
+      !sameRefsSorted(
+        collectionStateAfterWrite(sanityId)?.styles,
+        patch.styles as { _ref: string }[],
+      ),
+    );
 
   if (!dryRun && stylePatches.length > 0) {
     await commitPatches(sanityClient, stylePatches, batchSize, "Linking styles to families", progress);

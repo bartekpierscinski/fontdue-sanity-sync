@@ -198,6 +198,72 @@ describe("hardening", () => {
   });
 });
 
+// --- Superfamily membership ----------------------------------------------------
+
+describe("superfamily membership", () => {
+  const rel = { includeParentRef: true, includeFamilyRef: true, includeFeatureStyleRef: true };
+  const refs = (value: { _ref: string }[] | undefined) => (value ?? []).map((r) => r._ref).sort();
+
+  it("moves a standalone family into a superfamily without losing its styles", async () => {
+    const sanity = await seededSanity(rel);
+    mockFontdue({ catalog: { collections: [superfamily, family, { ...standalone, parent: { id: superfamily.id } }], licenses: [license] } });
+
+    const result = await run(sanity, rel);
+
+    expect(result.collections.updated).toBe(1);
+    const moved = sanity.get("fontdueCollection-12");
+    expect(moved?.parent?._ref).toBe("fontdueCollection-10");
+    expect(refs(moved?.styles)).toEqual(["fontdueStyle-3"]);
+    expect(refs(sanity.get("fontdueCollection-10")?.children)).toEqual(["fontdueCollection-11", "fontdueCollection-12"]);
+  });
+
+  it("keeps styles and feature style on a family that is rewritten", async () => {
+    const sanity = await seededSanity(rel);
+    mockFontdue({ catalog: { collections: [superfamily, { ...family, name: "Fibra Basic 2" }, standalone], licenses: [license] } });
+
+    await run(sanity, rel);
+
+    const renamed = sanity.get("fontdueCollection-11");
+    expect(renamed?.name).toBe("Fibra Basic 2");
+    expect(renamed?.parent?._ref).toBe("fontdueCollection-10");
+    expect(refs(renamed?.styles)).toEqual(["fontdueStyle-1", "fontdueStyle-2"]);
+    expect(renamed?.featureStyle?._ref).toBe("fontdueStyle-1");
+  });
+
+  it("clears the parent and the old superfamily's children when a family leaves", async () => {
+    const sanity = await seededSanity(rel);
+    mockFontdue({ catalog: { collections: [superfamily, { ...family, parent: null }, standalone], licenses: [license] } });
+
+    const result = await run(sanity, rel);
+
+    expect(result.collections.updated).toBe(1);
+    expect(sanity.get("fontdueCollection-11")).not.toHaveProperty("parent");
+    expect(refs(sanity.get("fontdueCollection-11")?.styles)).toEqual(["fontdueStyle-1", "fontdueStyle-2"]);
+    expect(refs(sanity.get("fontdueCollection-10")?.children)).toEqual([]);
+  });
+
+  it("sets the parent when Fontdue lists a child before its superfamily, then writes nothing", async () => {
+    const sanity = new FakeSanity();
+    mockFontdue({ catalog: { collections: [family, superfamily, standalone], licenses: [license] } });
+    await run(sanity, rel);
+    expect(sanity.get("fontdueCollection-11")?.parent?._ref).toBe("fontdueCollection-10");
+
+    sanity.log = [];
+    await run(sanity, rel);
+    expect(sanity.log).toEqual([expect.objectContaining({ kind: "createOrReplace", id: "fontdueSyncStatus" })]);
+  });
+
+  it("ignores a parent change when includeParentRef is off", async () => {
+    const sanity = await seededSanity();
+    mockFontdue({ catalog: { collections: [superfamily, family, { ...standalone, parent: { id: superfamily.id } }], licenses: [license] } });
+
+    const result = await run(sanity);
+
+    expect(result.collections.updated).toBe(0);
+    expect(sanity.get("fontdueCollection-12")).not.toHaveProperty("parent");
+  });
+});
+
 // --- Font packs -----------------------------------------------------------------
 
 describe("syncPacks", () => {
